@@ -1,6 +1,6 @@
 // Adapted from YouPiP by PoomSmart
-// Try to make this work in newer YT versions
-// This research based on YT version 21.06.2
+// Updated for YouTube 21.20.4 - removed dead hooks, fixed signatures
+
 #import <YouTubeHeader/MLAVPlayer.h>
 #import <YouTubeHeader/MLDefaultPlayerViewFactory.h>
 #import <YouTubeHeader/MLPlayerPool.h>
@@ -39,44 +39,18 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 
 %hook MLPlayerPoolImpl
 
-- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
-}
-
-- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
-}
-
-- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
-}
-
-- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
-}
-
+// Only surviving signature in 21.20.4
 - (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
     return makeAVPlayer(self, video, playerConfig, stickySettings);
-} 
-
-- (MLAVPlayerLayerView *)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
-    return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
 }
 
+// Updated: only mediaPlayerResources: variant exists in 21.20.4
 - (MLAVPlayerLayerView *)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
     MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
     return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
 }
 
-- (BOOL)canQueuePlayerPlayVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
-    return NO;
-}
-
-- (BOOL)canQueuePlayerPlayVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig reloadContext:(id)reloadContext {
-    return NO;
-}
-
+// Only surviving canQueuePlayerPlay signature in 21.20.4
 - (BOOL)canQueuePlayerPlayVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig reloadContext:(id)reloadContext error:(NSError **)error {
     return NO;
 }
@@ -90,15 +64,13 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 
 %hook MLPlayerPool
 
-- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings {
+// Only surviving signature in 21.20.4
+- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger reloadContext:(id)reloadContext mediaPlayerResources:(id)mediaPlayerResources recompositeProvider:(id)recompositeProvider {
     return makeAVPlayer(self, video, playerConfig, stickySettings);
 }
 
-- (id)acquirePlayerForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig stickySettings:(MLPlayerStickySettings *)stickySettings latencyLogger:(id)latencyLogger {
-    return makeAVPlayer(self, video, playerConfig, stickySettings);
-}
-
-- (MLAVPlayerLayerView *)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
+// Updated: only mediaPlayerResources: variant exists in 21.20.4
+- (MLAVPlayerLayerView *)playerViewForVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig mediaPlayerResources:(id)mediaPlayerResources {
     MLDefaultPlayerViewFactory *factory = [self valueForKey:@"_playerViewFactory"];
     return [factory AVPlayerViewForVideo:video playerConfig:playerConfig];
 }
@@ -108,7 +80,7 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     return %orig;
 }
 
-- (BOOL)canQueuePlayerPlayVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig {
+- (BOOL)canQueuePlayerPlayVideo:(MLVideo *)video playerConfig:(MLInnerTubePlayerConfig *)playerConfig reloadContext:(id)reloadContext error:(NSError **)error {
     return NO;
 }
 
@@ -187,7 +159,7 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 
 %end
 
-// Remove 2K and 4K options including HDR, since they don't work anyways.
+// Remove 2K, 4K and HDR options since they don't work without VP9 entitlements on sideloaded apps
 %hook MLHLSStreamSelector
 
 - (void)didLoadHLSMasterPlaylist:(id)arg1 {
