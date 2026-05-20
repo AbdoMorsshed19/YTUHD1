@@ -281,7 +281,8 @@ static NSString *const kSpoofed = @"YTSpoofed";
 - (void)stopLoading {
     [self.fwdTask cancel];
     [self.fwdSession invalidateAndCancel];
-    self.fwdTask = self.fwdSession = nil;
+    self.fwdTask = nil;
+    self.fwdSession = nil;
 }
 
 - (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t
