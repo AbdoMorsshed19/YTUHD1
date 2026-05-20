@@ -218,6 +218,33 @@ static NSData *spoofClientInBody(NSData *bodyData) {
 %end
 
 // ---------------------------------------------------------------------------
+// Suppress false "No stream" (Code=2) error
+//
+// When the TVHTML5 client spoof is active the player response has no DASH
+// adaptiveFormats list. YouTube's player framework checks adaptiveFormats
+// early in response processing, finds zero entries, generates:
+//   NSError(domain="com.google.ios.youtube.ErrorDomain.playback", code=2)
+// and calls -[YTMainAppVideoPlayerOverlayViewController handleError:].
+//
+// This happens BEFORE the HLS path runs, so the state machine enters the
+// error branch and never calls [avPlayer play] — even though AVPlayer has
+// already been handed hlsManifestUrl and is actively pre-buffering (proven
+// by 7+ MB of 200-OK segment downloads visible in Proxyman).
+//
+// Suppressing Code=2 lets the state machine continue past the error branch
+// and issue the play command against the already-buffered HLS content.
+// ---------------------------------------------------------------------------
+%hook YTMainAppVideoPlayerOverlayViewController
+- (void)handleError:(NSError *)error {
+    if (FixPlayback()
+        && error.code == 2
+        && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"])
+        return;
+    %orig;
+}
+%end
+
+// ---------------------------------------------------------------------------
 // HLS stream availability fix
 //
 // When the TVHTML5 spoof is active the player response has hlsManifestUrl
