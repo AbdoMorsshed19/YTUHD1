@@ -343,6 +343,32 @@ static void injectProtocol(NSURLSessionConfiguration *cfg) {
 
 %end
 
+// ---- Intercept at request-construction time ---------------------------------
+// Hooks the moment the JSON body is assigned to any NSMutableURLRequest whose
+// URL targets the player endpoint. This fires before the request reaches any
+// networking stack (NSURLSession, CFNetwork, Cronet, etc.) — the deepest
+// reliable hook point available from ObjC without binary patching.
+//
+// If %hook NSURLSession (above) already spoofed the body via NSURLProtocol,
+// spoofClientInBody() is idempotent for TVHTML5 bodies and returns unchanged.
+
+%hook NSMutableURLRequest
+
+- (void)setHTTPBody:(NSData *)data {
+    if (data.length > 0 && [self.URL.path containsString:@"/youtubei/v1/player"]) {
+        NSData *spoofed = spoofClientInBody(data);
+        if (spoofed && spoofed != data) {
+            [self setValue:@"7"                forHTTPHeaderField:@"X-Youtube-Client-Name"];
+            [self setValue:@"7.20240918.01.00" forHTTPHeaderField:@"X-Youtube-Client-Version"];
+            %orig(spoofed);
+            return;
+        }
+    }
+    %orig;
+}
+
+%end
+
 %ctor {
     if (!FixPlayback()) return;
     // Cover the shared session ([NSURLSession sharedSession]) too.
