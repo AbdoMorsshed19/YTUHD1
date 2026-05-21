@@ -30,6 +30,7 @@
 //    the stream-kill logic (belt-and-suspenders fallback).
 
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <YouTubeHeader/MLAVPlayer.h>
 #import <YouTubeHeader/MLDefaultPlayerViewFactory.h>
 #import <YouTubeHeader/MLHLSMasterPlaylist.h>
@@ -318,4 +319,32 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 %ctor {
     if (!FixPlayback()) return;
     %init;
+
+    // Runtime enumeration fallback: hook hasPoToken and isIosguardAttestationEnabled
+    // on EVERY ObjC class that responds to them, regardless of class name.
+    //
+    // hasPoToken: proto-generated boolean getter checked at the 10-second watchtime
+    // mark.  If it returns NO at that point YouTube kills the SABR stream ~1 second
+    // later.  We force it to YES so the watchtime guard sees a valid token.
+    //
+    // isIosguardAttestationEnabled: controls whether iOSGuard fires an iosantiabuse
+    // attestation request.  The static %hook iOSGuardManager above covers the
+    // expected class, but the actual instance may live on a differently-named class;
+    // this sweep catches every class that has the selector.
+    SEL hasPoTokenSel          = @selector(hasPoToken);
+    SEL isIosguardEnabledSel   = @selector(isIosguardAttestationEnabled);
+
+    IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
+    IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
+
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    for (unsigned int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (class_getInstanceMethod(cls, hasPoTokenSel))
+            class_replaceMethod(cls, hasPoTokenSel, yesIMP, "B@:");
+        if (class_getInstanceMethod(cls, isIosguardEnabledSel))
+            class_replaceMethod(cls, isIosguardEnabledSel, noIMP, "B@:");
+    }
+    free(classes);
 }
