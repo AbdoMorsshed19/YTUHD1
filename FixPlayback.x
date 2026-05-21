@@ -1,19 +1,33 @@
 // Adapted from YouPiP by PoomSmart
 // Updated for YouTube 21.20.4 - removed dead hooks, fixed signatures
 //
-// Root cause (confirmed via HAR analysis):
-//   makeAVPlayer() was creating MLAVPlayer WITHOUT mediaPlayerResources /
-//   recompositeProvider, which are required for proper initialisation in
-//   21.20.4.  The player was created but never loaded a URL → Code=2.
+// Root cause (confirmed via HAR + binary analysis):
 //
-//   WEB client spoof via setHTTPBody: was also a no-op: the /player call
-//   goes over QUIC and never touches NSMutableURLRequest.setHTTPBody:
-//   (confirmed: c=IOS in every CDN URL regardless of spoof state).
+// 1. makeAVPlayer() was creating MLAVPlayer WITHOUT mediaPlayerResources /
+//    recompositeProvider → player never loaded a URL → Code=2 immediately.
+//    Fix: set renderViewType=2 then call %orig so the pool creates a fully-
+//    initialised player with all resources.
 //
-// Fix: set renderViewType=2 on playerConfig *before* calling %orig in
-//   acquirePlayerForVideo:.  The pool creates a fully-initialised
-//   MLAVPlayer with all resources attached, which then reads hlsManifestUrl
-//   from the IOS client response and begins HLS playback.
+// 2. WEB client spoof via setHTTPBody: was a no-op: the /player call goes
+//    over QUIC and never touches NSMutableURLRequest.  (Removed.)
+//
+// 3. (Root cause of Code=14 "Something went wrong", confirmed via HAR)
+//    YouTube sends Apple AppAttest tokens to iosantiabuse-pa.googleapis.com
+//    to obtain PO (Proof of Origin) tokens for GVS authentication.  Inside
+//    LiveContainer the AppAttest carries LiveContainer's Team ID
+//    (LSMHR68PG6) instead of YouTube's, so every exchange returns
+//    400 "Precondition check failed."  After 9 consecutive failures the
+//    YouTube app aborts the SABR stream and shows Code=14.
+//
+//    Critically, GVS CDN is NOT enforcing PO tokens server-side — every
+//    segment request returns 200 regardless.  The YouTube app itself is
+//    the entity that kills the stream.
+//
+//    Fix A: Disable the PO token system via YTHotConfig flags so
+//    iosantiabuse is never called.
+//    Fix B: Hook YTIOSGuardSnapshotControllerImpl to intercept the
+//    attestation response handler and strip the error before it reaches
+//    the stream-kill logic (belt-and-suspenders fallback).
 
 #import <Foundation/Foundation.h>
 #import <YouTubeHeader/MLAVPlayer.h>
@@ -29,6 +43,9 @@
 extern BOOL FixPlayback();
 
 @interface YTGLMediaPlayerViewFactory : NSObject
+@end
+
+@interface YTIOSGuardSnapshotControllerImpl : NSObject
 @end
 
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
@@ -168,6 +185,39 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     return %orig;
 }
 
+%end
+
+// ---------------------------------------------------------------------------
+// PO Token bypass
+//
+// Confirmed via HAR: LiveContainer2 Team ID LSMHR68PG6 is embedded in the
+// Apple AppAttest payload sent to iosantiabuse-pa.googleapis.com/v1/exchange.
+// Google rejects it (400 "Precondition check failed.") because it's not
+// YouTube's real Team ID.  After 9 consecutive 400s the YouTube app aborts
+// the SABR stream (status 999) and shows Code=14.  GVS CDN serves all
+// segments at 200 without PO token enforcement — the app itself kills.
+//
+// Fix A: Disable PO token system via YTHotConfig flags (primary).
+// Fix B: Strip error from attestation response handler (fallback).
+// ---------------------------------------------------------------------------
+%hook YTHotConfig
+- (BOOL)iosClientGlobalConfigDisableIosPoTokens { return YES; }
+- (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerMedia { return NO; }
+- (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerInjection { return NO; }
+- (BOOL)iosPlayerClientSharedConfigIosSpsEnablePoTokenCabr { return NO; }
+%end
+
+%hook YTIOSGuardSnapshotControllerImpl
+// Strip the attestation error before it reaches the SABR-kill logic.
+// Passing nil for response + error simulates "no snapshot obtained, no
+// error" — the caller skips the failure path and does not abort the stream.
+- (void)handleAttestationChallengeResponse:(id)response
+                                     error:(NSError *)error
+                                   videoID:(NSString *)videoID
+                                identityID:(NSString *)identityID
+                         completionHandler:(id)completionHandler {
+    %orig(nil, nil, videoID, identityID, completionHandler);
+}
 %end
 
 // ---------------------------------------------------------------------------
