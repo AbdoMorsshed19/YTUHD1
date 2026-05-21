@@ -168,13 +168,23 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 %end
 
 // ---------------------------------------------------------------------------
-// Client type spoofing: IOS → TVHTML5
+// Client type spoofing: IOS → WEB (web_safari)
 //
-// The IOS client's /youtubei/v1/player response contains DASH streams only;
-// TVHTML5 receives hlsManifestUrl instead, which AVPlayer can consume without
-// a PO Token. The request body is JSON even though transport is QUIC (Cronet
-// uses the NSMutableURLRequest body data directly), so this hook fires before
-// the transport layer and rewrites the body in-place.
+// Problem: IOS client responses contain only DASH streams which require a
+// PO Token for GVS (CDN) access. Sideloaded apps cannot obtain a valid PO
+// Token because iOSGuard/DeviceCheck/AppAttest reject the wrong Team ID.
+//
+// Solution: spoof as the WEB client with a Safari user-agent (yt-dlp calls
+// this "web_safari"). This client:
+//   1. Returns DASH adaptiveFormats  → satisfies YouTube's stream checker,
+//      preventing the false Code=2 "No stream" error
+//   2. Returns hlsManifestUrl        → AVPlayer uses HLS for actual playback
+//   3. HLS GVS requests are PO Token-exempt for web_safari (per yt-dlp PO
+//      Token Guide: "provides HLS formats which do not require PO Token for
+//      GVS at this time")
+//
+// The body is JSON even though transport is QUIC (Cronet reads the
+// NSMutableURLRequest body before handing it to the transport layer).
 // ---------------------------------------------------------------------------
 
 static NSData *spoofClientInBody(NSData *bodyData) {
@@ -189,13 +199,20 @@ static NSData *spoofClientInBody(NSData *bodyData) {
     NSMutableDictionary *client = ctx[@"client"];
     if (![client isKindOfClass:[NSMutableDictionary class]]) return bodyData;
     if (![client[@"clientName"] isEqualToString:@"IOS"])     return bodyData;
-    client[@"clientName"]    = @"TVHTML5";
-    client[@"clientVersion"] = @"7.20240918.01.00";
+
+    // web_safari context (from yt-dlp _base.py, INNERTUBE_CONTEXT_CLIENT_NAME=1)
+    client[@"clientName"]    = @"WEB";
+    client[@"clientVersion"] = @"2.20260114.08.00";
+    client[@"userAgent"]     = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                                "Version/15.5 Safari/605.1.15,gzip(gfe)";
+    // Remove iOS-only fields that would look inconsistent in a WEB context
     [client removeObjectForKey:@"deviceMake"];
     [client removeObjectForKey:@"deviceModel"];
     [client removeObjectForKey:@"osName"];
     [client removeObjectForKey:@"osVersion"];
     [client removeObjectForKey:@"deviceExperimentId"];
+
     NSData *result = [NSJSONSerialization dataWithJSONObject:body options:0 error:&err];
     return err ? bodyData : result;
 }
@@ -206,8 +223,8 @@ static NSData *spoofClientInBody(NSData *bodyData) {
     if (data.length > 0 && [self.URL.path containsString:@"/youtubei/v1/player"]) {
         NSData *spoofed = spoofClientInBody(data);
         if (spoofed && spoofed != data) {
-            [self setValue:@"7"                forHTTPHeaderField:@"X-Youtube-Client-Name"];
-            [self setValue:@"7.20240918.01.00" forHTTPHeaderField:@"X-Youtube-Client-Version"];
+            [self setValue:@"1"                  forHTTPHeaderField:@"X-Youtube-Client-Name"];
+            [self setValue:@"2.20260114.08.00"   forHTTPHeaderField:@"X-Youtube-Client-Version"];
             %orig(spoofed);
             return;
         }
