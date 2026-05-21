@@ -51,6 +51,9 @@ extern BOOL FixPlayback();
 @interface IGDPOTokenMinter : NSObject
 @end
 
+@interface iOSGuardManager : NSObject
+@end
+
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
     if (!hamplayerConfig) return;
     hamplayerConfig.renderViewType = 2;
@@ -207,9 +210,6 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 // Kill-switch: disable the entire iOS PO token system.
 - (BOOL)iosClientGlobalConfigDisableIosPoTokens { return YES; }
 // Prevent the PO token manager from initialising at app startup.
-// Without this, the manager fires one background iosantiabuse exchange
-// *before* the lazy flags above are checked, causing a 400 that sets
-// "no token available" state and starts the ~5 s SABR kill timer.
 - (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerInitializationOnStartup { return NO; }
 // Delay minter initialisation indefinitely — belt-and-suspenders for startup.
 - (BOOL)iosPlayerClientSharedConfigDelayPoTokenMinterInitialization { return YES; }
@@ -217,21 +217,39 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 - (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerMedia { return NO; }
 - (BOOL)iosPlayerClientSharedConfigEnablePoTokenManagerInjection { return NO; }
 - (BOOL)iosPlayerClientSharedConfigIosSpsEnablePoTokenCabr { return NO; }
+// If a stored challenge exists, reuse it (prevents new iosantiabuse calls
+// on session restarts triggered by seeks).
+- (BOOL)iosPlayerClientSharedConfigShouldReuseIosguardChallengeForAttestation { return YES; }
+%end
+
+%hook iOSGuardManager
+// Disabling attestation globally prevents iOSGuard from ever requesting a
+// challenge via iosantiabuse-pa.googleapis.com.  Without a challenge request
+// the 400 "Precondition check failed" response is never received, so the C++
+// SABR session manager never caches a "token invalid" state.  That cached
+// state is what causes seek-triggered SABR restarts to kill the stream after
+// ~5 seconds — the restart reads the cached failure and starts a kill timer
+// without re-calling IGDPOTokenMinter.mintPOTokenImmediately:.
+- (BOOL)isIosguardAttestationEnabled { return NO; }
 %end
 
 %hook YTIOSGuardSnapshotControllerImpl
-// Swallow the attestation response entirely — do not call %orig and do not
-// invoke the completion handler.  Calling %orig(nil, nil, …) was still
-// advancing the failure state machine (the original impl treats a nil
-// response + nil error as an undefined state and raised its own error).
-// Leaving the completion handler uncalled means no "token failed" signal
-// ever reaches the SABR kill-timer, so the stream is not aborted.
+// Intercept the iosantiabuse response handler.  When isIosguardAttestationEnabled
+// returns NO (iOSGuardManager hook above) this method should never be reached
+// at all.  This hook is kept as a belt-and-suspenders fallback.
+//
+// Previously this was a pure no-op (completion handler never called), which
+// left the caller in an indefinite wait — the caller's own 5-second callback
+// timeout then fired and killed the SABR stream through a secondary path.
+// Now we call completionHandler(nil, nil): "completed with no snapshot and no
+// error."  The caller skips the failure branch and the kill timer is not armed.
 - (void)handleAttestationChallengeResponse:(id)response
                                      error:(NSError *)error
                                    videoID:(NSString *)videoID
                                 identityID:(NSString *)identityID
                          completionHandler:(id)completionHandler {
-    // intentionally a no-op
+    if (completionHandler)
+        ((void (^)(id, NSError *))completionHandler)(nil, nil);
 }
 %end
 
