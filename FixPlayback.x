@@ -216,22 +216,31 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 //
 //   Root cause of the 69-73 ms SABR kill (confirmed via HAR analysis):
 //
-//   When a video starts, YouTube POSTs to /att/get with a query param ?t=
-//   (a per-session attestation token / CPN).  The server response is a
-//   proto that sometimes contains Field 27 — a 51-byte enforcement blob
-//   encoding PO token validation state.  When Field 27 is present, the
+//   The ?t= parameter IS the CPN (Client Playback Nonce) for the active
+//   video session.  YouTube POSTs to /att/get?t=<CPN> as an attestation
+//   heartbeat.  The server response is a proto that sometimes contains
+//   Field 27 — a 51-byte enforcement blob.  When Field 27 is present, the
 //   YouTube player kills the SABR stream exactly 69-73 ms after the
 //   response arrives (confirmed: two qoe:mta events, gaps of 69 ms and
 //   73 ms, each immediately following an att/get?t= response).
 //
-//   Startup att/get calls (no ?t=) never contain Field 27 and never kill.
-//   att/get?t= calls for some videos also lack Field 27 and don't kill —
-//   but we cannot know in advance which ones will trigger enforcement.
+//   CRITICAL: att/get?t= is also the server-side keep-alive.  When the
+//   server receives att/get?t=<CPN> it knows the client is still trying to
+//   obtain a PO token and keeps STREAM_PROTECTION_STATUS = ATTESTATION_PENDING
+//   (server continues pushing media chunks).  Blocking att/get?t= entirely
+//   (returning synthetic 200 without forwarding) stops the server heartbeat,
+//   causing the server to transition to ATTESTATION_REQUIRED sooner — the
+//   video buffer shrinks from ~60-79 s to under 2 s (confirmed via HAR
+//   comparison of fixplaybacknoiosantiabuse.har vs newhar.har).
 //
-//   Fix: intercept att/get?t= requests and return an empty 200 proto body.
-//   Field 27 is never delivered to the parser; the kill timer is never
-//   armed.  The startup att/get (no ?t=) is left unmodified so experiment
-//   flags continue to load normally.
+//   Fix — fire-and-forget proxy:
+//     a) Forward the real att/get?t= request to the YouTube server so the
+//        server keeps receiving heartbeats and stays in ATTESTATION_PENDING.
+//     b) Return an empty 200 proto body to the client immediately — Field 27
+//        is never delivered to the parser, kill timer is never armed.
+//
+//   Startup att/get calls (no ?t=) are left completely unmodified so
+//   experiment flags continue to load normally.
 // ---------------------------------------------------------------------------
 @interface YTUHDAntiAbuseProtocol : NSURLProtocol
 @end
@@ -264,18 +273,60 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 }
 
 - (void)startLoading {
-    NSData *body;
     if ([self.request.URL.host hasSuffix:@"iosantiabuse-pa.googleapis.com"]) {
         // Proto: field 1 (bytes), length 8, eight zero bytes.
         // C++ sees 200 + non-error proto → "exchange succeeded".
         // Token value is never validated client-side or server-side.
         static const uint8_t kAntiAbuseBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
-        body = [NSData dataWithBytes:kAntiAbuseBody length:sizeof(kAntiAbuseBody)];
-    } else {
-        // att/get?t= — return empty proto so Field 27 (enforcement blob)
-        // is never delivered.  The kill timer is never armed.
-        body = [NSData data];
+        NSData *body = [NSData dataWithBytes:kAntiAbuseBody length:sizeof(kAntiAbuseBody)];
+        NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+            initWithURL:self.request.URL
+             statusCode:200
+            HTTPVersion:@"HTTP/2.0"
+           headerFields:@{@"Content-Type":  @"application/x-protobuf",
+                          @"Cache-Control": @"no-store"}];
+        [self.client URLProtocol:self
+              didReceiveResponse:response
+              cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:body];
+        [self.client URLProtocolDidFinishLoading:self];
+        return;
     }
+
+    // att/get?t= — fire-and-forget proxy:
+    //
+    // 1. Forward the real request to YouTube's server (tagged YTUHDHandled so
+    //    this protocol doesn't intercept its own side-channel request).  The
+    //    server receives the attestation heartbeat and stays in
+    //    ATTESTATION_PENDING, continuing to push media chunks.
+    //
+    // 2. Immediately return an empty 200 to the calling YouTube code.  Field 27
+    //    (the enforcement blob) is never present in an empty response, so the
+    //    kill timer is never armed.
+    //
+    // The side-channel session is created once and reused; it uses the default
+    // session configuration which also gets our protocolClasses injected, but
+    // the YTUHDHandled property prevents re-entry.
+
+    // -- Step 1: fire-and-forget the real request --
+    static NSURLSession *sideChannel;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // Use default configuration (ephemeral would skip disk cache, fine either way).
+        NSURLSessionConfiguration *cfg =
+            [NSURLSessionConfiguration defaultSessionConfiguration];
+        sideChannel = [NSURLSession sessionWithConfiguration:cfg];
+    });
+
+    NSMutableURLRequest *realReq = [self.request mutableCopy];
+    // Tag it so canInitWithRequest: returns NO and the request goes straight
+    // to the network without being caught by this protocol again.
+    [NSURLProtocol setProperty:@YES forKey:@"YTUHDHandled" inRequest:realReq];
+    [[sideChannel dataTaskWithRequest:realReq completionHandler:
+        ^(NSData *d, NSURLResponse *r, NSError *e) { /* discard — server ack only */ }
+    ] resume];
+
+    // -- Step 2: return empty proto to the client --
     NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
         initWithURL:self.request.URL
          statusCode:200
@@ -285,7 +336,7 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     [self.client URLProtocol:self
           didReceiveResponse:response
           cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:body];
+    [self.client URLProtocol:self didLoadData:[NSData data]];
     [self.client URLProtocolDidFinishLoading:self];
 }
 
