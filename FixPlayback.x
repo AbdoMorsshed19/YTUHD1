@@ -195,30 +195,43 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 %end
 
 // ---------------------------------------------------------------------------
-// iosantiabuse network intercept (NSURLProtocol)
+// Network intercept (NSURLProtocol) — two endpoints
 //
-// Root cause of the 4-second SABR kill (confirmed via HAR analysis):
+// ── Endpoint 1: iosantiabuse-pa.googleapis.com/v1/exchange ─────────────────
 //
-//   iosantiabuse-pa.googleapis.com/v1/exchange returns 400 "Precondition
-//   check failed" because LiveContainer2 re-signs YouTube with Team ID
-//   LSMHR68PG6 instead of YouTube's real Team ID, so AppAttest fails server-
-//   side.  The C++ iosguard layer inside YouTube parses that 400 HTTP status
-//   BEFORE any ObjC code runs, and writes a "exchange failed" state into a
-//   C++ global.  When the NEXT SABR session starts (e.g. after the user
-//   switches videos), the session reads the cached C++ failure and arms a
-//   4-second kill timer that bypasses the ObjC hasPoToken check entirely.
-//   Confirmed: qoe:mta fires at exactly 4.08 s after video 2 SABR start,
-//   while video 1 (whose SABR started BEFORE iosantiabuse returned) plays
-//   fine.
+//   Root cause of the 4-second SABR kill (confirmed via HAR analysis):
 //
-// Fix: intercept at NSURLProtocol level, replacing the 400 with a synthetic
-// 200 + minimal proto body before the bytes reach any C++ code.  The C++
-// exchange handler sees status 200, transitions to "succeeded", never writes
-// the failure state, and no kill timer is armed.
+//   LiveContainer2 re-signs YouTube with Team ID LSMHR68PG6 instead of
+//   YouTube's real Team ID, so every AppAttest exchange returns 400
+//   "Precondition check failed."  The C++ iosguard layer parses that 400
+//   BEFORE any ObjC code runs, writing "exchange failed" to a C++ global.
+//   When the next SABR session starts, it reads the cached failure and arms
+//   a 4-second kill timer — bypassing the ObjC hasPoToken check entirely.
 //
-// The fake token is proto field 1 (bytes) = 8 zero bytes.  GVS does not
-// validate token content server-side — all videoplayback and initplayback
-// requests return 200 regardless of token value (confirmed across all HARs).
+//   Fix: replace the 400 with a synthetic 200 + minimal proto body.
+//   C++ sees a successful exchange, never writes the failure state, and no
+//   kill timer is armed.  Token content is not validated server-side.
+//
+// ── Endpoint 2: youtubei.googleapis.com/youtubei/v1/att/get?t=<token> ──────
+//
+//   Root cause of the 69-73 ms SABR kill (confirmed via HAR analysis):
+//
+//   When a video starts, YouTube POSTs to /att/get with a query param ?t=
+//   (a per-session attestation token / CPN).  The server response is a
+//   proto that sometimes contains Field 27 — a 51-byte enforcement blob
+//   encoding PO token validation state.  When Field 27 is present, the
+//   YouTube player kills the SABR stream exactly 69-73 ms after the
+//   response arrives (confirmed: two qoe:mta events, gaps of 69 ms and
+//   73 ms, each immediately following an att/get?t= response).
+//
+//   Startup att/get calls (no ?t=) never contain Field 27 and never kill.
+//   att/get?t= calls for some videos also lack Field 27 and don't kill —
+//   but we cannot know in advance which ones will trigger enforcement.
+//
+//   Fix: intercept att/get?t= requests and return an empty 200 proto body.
+//   Field 27 is never delivered to the parser; the kill timer is never
+//   armed.  The startup att/get (no ?t=) is left unmodified so experiment
+//   flags continue to load normally.
 // ---------------------------------------------------------------------------
 @interface YTUHDAntiAbuseProtocol : NSURLProtocol
 @end
@@ -228,7 +241,18 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if ([NSURLProtocol propertyForKey:@"YTUHDHandled" inRequest:request])
         return NO;
-    return [request.URL.host hasSuffix:@"iosantiabuse-pa.googleapis.com"];
+    NSString *host = request.URL.host;
+    // iosantiabuse-pa.googleapis.com — all paths
+    if ([host hasSuffix:@"iosantiabuse-pa.googleapis.com"])
+        return YES;
+    // youtubei/v1/att/get — ONLY when the ?t= enforcement token is present.
+    // Without ?t= the endpoint loads startup experiment flags; those calls
+    // must reach the server so the app initialises correctly.
+    if ([host hasSuffix:@"youtubei.googleapis.com"]
+        && [request.URL.path hasSuffix:@"/att/get"]
+        && [request.URL.query hasPrefix:@"t="])
+        return YES;
+    return NO;
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
@@ -240,11 +264,18 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
 }
 
 - (void)startLoading {
-    // Proto: field 1 (bytes), length 8, eight zero bytes.
-    // C++ sees 200 + non-error proto → "exchange succeeded, token = [8 zeros]".
-    // Token value is never validated client-side or server-side.
-    static const uint8_t kBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
-    NSData *body = [NSData dataWithBytes:kBody length:sizeof(kBody)];
+    NSData *body;
+    if ([self.request.URL.host hasSuffix:@"iosantiabuse-pa.googleapis.com"]) {
+        // Proto: field 1 (bytes), length 8, eight zero bytes.
+        // C++ sees 200 + non-error proto → "exchange succeeded".
+        // Token value is never validated client-side or server-side.
+        static const uint8_t kAntiAbuseBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
+        body = [NSData dataWithBytes:kAntiAbuseBody length:sizeof(kAntiAbuseBody)];
+    } else {
+        // att/get?t= — return empty proto so Field 27 (enforcement blob)
+        // is never delivered.  The kill timer is never armed.
+        body = [NSData data];
+    }
     NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
         initWithURL:self.request.URL
          statusCode:200
