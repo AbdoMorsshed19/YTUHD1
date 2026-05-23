@@ -54,11 +54,6 @@ extern BOOL FixPlayback();
 @interface iOSGuardManager : NSObject
 @end
 
-// YTIMediaCommonConfig is a proto-generated class owned by MLInnerTubePlayerConfig.
-// Its useServerDrivenAbr property controls whether the HAMPlayer SDK uses the
-// SABR (Server-Driven ABR) protocol or falls back to client-side ABR via HLS.
-@interface YTIMediaCommonConfig : NSObject
-@end
 
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
     if (!hamplayerConfig) return;

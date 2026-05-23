@@ -17,6 +17,7 @@
 #import <YouTubeHeader/YTPlayerTapToRetryResponderEvent.h>
 #import <YouTubeHeader/YTIIcon.h>
 #import <YouTubeHeader/YTColor.h>
+#import <YouTubeHeader/YTIMediaCommonConfig.h>
 
 #define IOS_BUILD "19H411" // iOS 15.8.7
 #define MAX_FPS 60
