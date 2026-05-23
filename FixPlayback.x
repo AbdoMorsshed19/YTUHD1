@@ -1,33 +1,32 @@
 // Adapted from YouPiP by PoomSmart
 // Updated for YouTube 21.20.4 - removed dead hooks, fixed signatures
 //
-// Root cause (confirmed via HAR + binary analysis):
+// Root cause summary (confirmed via HAR + binary analysis + proto RE):
 //
-// 1. makeAVPlayer() was creating MLAVPlayer WITHOUT mediaPlayerResources /
-//    recompositeProvider → player never loaded a URL → Code=2 immediately.
-//    Fix: set renderViewType=2 then call %orig so the pool creates a fully-
-//    initialised player with all resources.
+// YouTube on iOS uses SABR (Server-Driven ABR) via the HAMPlayer SDK.
+// SABR requires a PO (Proof of Origin) token minted via Apple AppAttest.
+// Inside LiveContainer2 the AppAttest payload carries LiveContainer's
+// re-signing Team ID (LSMHR68PG6), so every exchange with
+// iosantiabuse-pa.googleapis.com returns 400 — no valid PO token is ever
+// obtained.  GVS responds to OnesieRequests that have a missing/empty
+// poToken with STREAM_PROTECTION_STATUS=3 (ATTESTATION_REQUIRED), which
+// the client's C++ SABR session manager processes and converts to
+// Code=14 "Something went wrong".
 //
-// 2. WEB client spoof via setHTTPBody: was a no-op: the /player call goes
-//    over QUIC and never touches NSMutableURLRequest.  (Removed.)
+// Key insight: this Code=14 kill is delivered via the encrypted UMP SABR
+// stream — it cannot be intercepted by NSURLProtocol or any ObjC hook.
+// Client-side fixes (disabling PO token manager, faking iosantiabuse
+// responses, fire-and-forget att/get proxying) address symptoms but not
+// the kill path itself.
 //
-// 3. (Root cause of Code=14 "Something went wrong", confirmed via HAR)
-//    YouTube sends Apple AppAttest tokens to iosantiabuse-pa.googleapis.com
-//    to obtain PO (Proof of Origin) tokens for GVS authentication.  Inside
-//    LiveContainer the AppAttest carries LiveContainer's Team ID
-//    (LSMHR68PG6) instead of YouTube's, so every exchange returns
-//    400 "Precondition check failed."  After 9 consecutive failures the
-//    YouTube app aborts the SABR stream and shows Code=14.
+// The correct fix is to disable SABR entirely via useServerDrivenAbr=NO
+// on YTIMediaCommonConfig.  HAMPlayer then falls back to client-side ABR
+// using the hlsManifestUrl from the /youtubei/v1/player response.  HLS
+// segment requests to GVS currently do NOT require PO tokens, so playback
+// proceeds without any attestation machinery.
 //
-//    Critically, GVS CDN is NOT enforcing PO tokens server-side — every
-//    segment request returns 200 regardless.  The YouTube app itself is
-//    the entity that kills the stream.
-//
-//    Fix A: Disable the PO token system via YTHotConfig flags so
-//    iosantiabuse is never called.
-//    Fix B: Hook YTIOSGuardSnapshotControllerImpl to intercept the
-//    attestation response handler and strip the error before it reaches
-//    the stream-kill logic (belt-and-suspenders fallback).
+// Stack after fix: AVPlayer (renderViewType=2) + HLS manifest → GVS HLS
+// segments → no SABR → no STREAM_PROTECTION_STATUS → no Code=14.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -53,6 +52,12 @@ extern BOOL FixPlayback();
 @end
 
 @interface iOSGuardManager : NSObject
+@end
+
+// YTIMediaCommonConfig is a proto-generated class owned by MLInnerTubePlayerConfig.
+// Its useServerDrivenAbr property controls whether the HAMPlayer SDK uses the
+// SABR (Server-Driven ABR) protocol or falls back to client-side ABR via HLS.
+@interface YTIMediaCommonConfig : NSObject
 @end
 
 static void forceRenderViewTypeBase(YTIHamplayerConfig *hamplayerConfig) {
@@ -165,6 +170,38 @@ static void forceRenderViewType(YTHotConfig *hotConfig) {
     %orig;
 }
 
+%end
+
+// ---------------------------------------------------------------------------
+// SABR bypass — the actual root cause of STREAM_PROTECTION_STATUS=3 Code=14
+//
+// SABR (Server-Driven ABR) is YouTube's server-push adaptive bitrate protocol.
+// The client initiates a SABR session by sending an OnesieRequest
+// (initplayback) to the GVS CDN.  The OnesieRequest's StreamerContext (field
+// 10, plaintext proto) must include a valid PO (Proof of Origin) token minted
+// via Apple AppAttest.  Inside LiveContainer2, AppAttest embeds LiveContainer's
+// re-signing Team ID (LSMHR68PG6) instead of YouTube's, so every AppAttest
+// exchange returns 400 — no valid PO token can be obtained.
+//
+// When GVS receives an OnesieRequest with a missing/empty poToken it sends
+// STREAM_PROTECTION_STATUS=2 (ATTESTATION_PENDING) and then
+// STREAM_PROTECTION_STATUS=3 (ATTESTATION_REQUIRED) once the grace period
+// expires.  The client's C++ SABR session manager reads Status=3 from the UMP
+// stream and fires Code=14 "Something went wrong" — this happens regardless
+// of any client-side ObjC-layer fix because the enforcement message travels
+// inside the encrypted SABR UMP stream where NSURLProtocol cannot reach it.
+//
+// Fix: returning NO from useServerDrivenAbr causes HAMPlayer to skip the
+// OnesieRequest entirely and fall back to client-side ABR.  Client-side ABR
+// on iOS uses the hlsManifestUrl provided by the /youtubei/v1/player API
+// response.  HLS segment requests to GVS currently do NOT require PO token
+// validation, so the stream plays without any attestation machinery.
+//
+// Combined with renderViewType=2 (AVPlayer renderer) the complete stack is:
+//   AVPlayer + HLS manifest → GVS HLS segments → no SABR → no PO token → ✓
+// ---------------------------------------------------------------------------
+%hook YTIMediaCommonConfig
+- (BOOL)useServerDrivenAbr { return NO; }
 %end
 
 %hook YTGLMediaPlayerViewFactory
