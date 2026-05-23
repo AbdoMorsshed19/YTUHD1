@@ -309,6 +309,30 @@ static NSArray *dropWebM(NSArray *formats) {
 %end
 
 // ---------------------------------------------------------------------------
+// MLStreamingData format filter — highest-level ObjC interception point
+//
+// The ABR policy hooks above (MLABRPolicy*, HAMDefaultABRPolicy) target the
+// ObjC ABR objects, but in YouTube 21.x HAMPlayer's C++ ABR core reads the
+// format list directly via objc_msgSend on MLStreamingData.adaptiveStreams —
+// it never goes through the ObjC ABR policy objects at all.  That's why the
+// dropWebM() calls in those hooks are effectively dead code.
+//
+// MLStreamingData.adaptiveStreams IS the authoritative format list: it returns
+// NSArray<MLRemoteStream *>, where MLRemoteStream is a subclass of MLFormat.
+// The existing dropWebM() predicate (which checks [[fmt URL] absoluteString]
+// for "mime=audio/webm" / "mime=video/webm") works directly on MLRemoteStream
+// objects because they inherit -URL from MLFormat.
+//
+// By filtering here we remove WebM/Opus (itag=251) and WebM/VP9 before C++
+// ever sees the format list, so the ABR algorithm can only select H.264 video
+// and AAC audio — formats that don't trigger GVS PO token enforcement for the
+// IOS client.
+// ---------------------------------------------------------------------------
+%hook MLStreamingData
+- (NSArray *)adaptiveStreams { return dropWebM(%orig); }
+%end
+
+// ---------------------------------------------------------------------------
 // Network intercept (NSURLProtocol) — two endpoints
 //
 // ── Endpoint 1: iosantiabuse-pa.googleapis.com/v1/exchange ─────────────────
@@ -592,7 +616,8 @@ static NSArray *dropWebM(NSArray *formats) {
 - (void)handleError:(NSError *)error {
     if (FixPlayback()
         && [error.domain isEqualToString:@"com.google.ios.youtube.ErrorDomain.playback"]
-        && (error.code == 2   // "No stream" — AVPlayer found no HLS URL
+        && (error.code == 0   // "Something went wrong" — HAMPlayer DASH 403 (itag=251)
+            || error.code == 2   // "No stream" — AVPlayer found no HLS URL
             || error.code == 14)) // "Something went wrong" — PO token grace-timer abort
         return;
     %orig;

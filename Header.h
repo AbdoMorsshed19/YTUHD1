@@ -18,6 +18,7 @@
 #import <YouTubeHeader/YTPlayerTapToRetryResponderEvent.h>
 #import <YouTubeHeader/YTIIcon.h>
 #import <YouTubeHeader/YTColor.h>
+#import <YouTubeHeader/MLStreamingData.h>
 #import <YouTubeHeader/YTIMediaCommonConfig.h>
 
 #define IOS_BUILD "19H411" // iOS 15.8.7
