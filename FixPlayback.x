@@ -30,6 +30,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import <YouTubeHeader/MLAVPlayer.h>
 #import <YouTubeHeader/MLDefaultPlayerViewFactory.h>
 #import <YouTubeHeader/MLHLSMasterPlaylist.h>
@@ -440,22 +441,57 @@ static NSArray *dropWebM(NSArray *formats) {
 
 - (void)startLoading {
     if ([self.request.URL.host hasSuffix:@"iosantiabuse-pa.googleapis.com"]) {
-        // Proto: field 1 (bytes), length 8, eight zero bytes.
-        // C++ sees 200 + non-error proto → "exchange succeeded".
-        // Token value is never validated client-side or server-side.
-        static const uint8_t kAntiAbuseBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
-        NSData *body = [NSData dataWithBytes:kAntiAbuseBody length:sizeof(kAntiAbuseBody)];
-        NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
-            initWithURL:self.request.URL
-             statusCode:200
-            HTTPVersion:@"HTTP/2.0"
-           headerFields:@{@"Content-Type":  @"application/x-protobuf",
-                          @"Cache-Control": @"no-store"}];
-        [self.client URLProtocol:self
-              didReceiveResponse:response
-              cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-        [self.client URLProtocol:self didLoadData:body];
-        [self.client URLProtocolDidFinishLoading:self];
+        // Rate-limit: allow one synthetic 200 per kAAMinInterval seconds.
+        // Without this gate the synthetic 200 causes C++ to immediately retry
+        // in a tight loop (~100 req/s), flooding the FLEX network log.
+        //
+        // Excess requests receive HTTP 429 + Retry-After so that any
+        // HTTP-compliant backoff logic in C++ slows the retry cadence.
+        // After one successful exchange C++ should not need another for
+        // many seconds; the 10 s window is conservative.
+        static os_unfair_lock aaLock = OS_UNFAIR_LOCK_INIT;
+        static CFAbsoluteTime aaNextAllowed = 0;
+        static const CFTimeInterval kAAMinInterval = 10.0;
+
+        os_unfair_lock_lock(&aaLock);
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        BOOL allowed = (now >= aaNextAllowed);
+        if (allowed) aaNextAllowed = now + kAAMinInterval;
+        os_unfair_lock_unlock(&aaLock);
+
+        if (allowed) {
+            // Proto: field 1 (bytes), length 8, eight zero bytes.
+            // C++ sees 200 + non-error proto → "exchange succeeded".
+            static const uint8_t kAntiAbuseBody[] = { 0x0a, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
+            NSData *body = [NSData dataWithBytes:kAntiAbuseBody length:sizeof(kAntiAbuseBody)];
+            NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+                initWithURL:self.request.URL
+                 statusCode:200
+                HTTPVersion:@"HTTP/2.0"
+               headerFields:@{@"Content-Type":  @"application/x-protobuf",
+                              @"Cache-Control": @"no-store"}];
+            [self.client URLProtocol:self
+                  didReceiveResponse:response
+                  cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:body];
+            [self.client URLProtocolDidFinishLoading:self];
+        } else {
+            // 429 tells HTTP clients to back off; Retry-After: 10 gives them
+            // the exact window.  Empty proto body — C++ should not parse it
+            // as an error, just as "no new data, try later".
+            NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+                initWithURL:self.request.URL
+                 statusCode:429
+                HTTPVersion:@"HTTP/2.0"
+               headerFields:@{@"Content-Type":  @"application/x-protobuf",
+                              @"Retry-After":   @"10",
+                              @"Cache-Control": @"no-store"}];
+            [self.client URLProtocol:self
+                  didReceiveResponse:response
+                  cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:[NSData data]];
+            [self.client URLProtocolDidFinishLoading:self];
+        }
         return;
     }
 
@@ -658,31 +694,30 @@ static NSArray *dropWebM(NSArray *formats) {
     // using the default URL loading system (complements the configuration hook).
     [NSURLProtocol registerClass:[YTUHDAntiAbuseProtocol class]];
 
-    // Runtime enumeration: hook hasPoToken and isIosguardAttestationEnabled on
-    // every ObjC class that has them, regardless of class name.
+    // Runtime enumeration: replace hasPoToken and isIosguardAttestationEnabled
+    // on every ObjC class that implements them, regardless of class name.
     //
-    // WHY dispatch_async instead of running inline in %ctor:
-    // %ctor runs at dyld initialiser time — before the main run loop starts and
-    // before many proto-generated GPBMessage subclasses have been registered
-    // with the ObjC runtime.  class_copyMethodList at that point misses those
-    // classes, so the replacement never lands.  Dispatching to the main queue
-    // defers until the first main-run-loop tick (i.e. after UIApplicationMain
-    // returns control, well before the user can open any video).  By that point
-    // 100% of ObjC classes are registered and all +initialize methods have run.
+    // We run the sweep TWICE:
     //
-    // hasPoToken: proto-generated presence check fired at the 10-second watchtime
-    // mark.  Returning YES prevents the SABR kill timer from arming.
+    // 1. Synchronously here in %ctor — catches regular ObjC classes that are
+    //    already registered at dylib-load time (including iOSGuardManager and
+    //    related classes).  This ensures the replacement is in place before any
+    //    YouTube initialisation code runs, preventing iosantiabuse calls from
+    //    firing in the window between dyld and the first run-loop tick.
+    //    Without this sync pass those early calls create the 100-req/s loop that
+    //    floods the FLEX network log.
     //
-    // isIosguardAttestationEnabled: returning NO stops iOSGuard from ever issuing
-    // an iosantiabuse challenge request.  The static %hook iOSGuardManager covers
-    // the expected name; this sweep catches any differently-named class.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        SEL hasPoTokenSel        = @selector(hasPoToken);
-        SEL isIosguardEnabledSel = @selector(isIosguardAttestationEnabled);
+    // 2. Async on the main queue — catches proto-generated GPBMessage subclasses
+    //    that are registered lazily after UIApplicationMain returns control.
+    //    hasPoToken is generated by the proto compiler and lives on such a class.
 
-        IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
-        IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
+    SEL hasPoTokenSel        = @selector(hasPoToken);
+    SEL isIosguardEnabledSel = @selector(isIosguardAttestationEnabled);
 
+    IMP yesIMP = imp_implementationWithBlock(^BOOL(__unused id _self) { return YES; });
+    IMP noIMP  = imp_implementationWithBlock(^BOOL(__unused id _self) { return NO;  });
+
+    void (^sweep)(void) = ^{
         unsigned int classCount = 0;
         Class *classes = objc_copyClassList(&classCount);
         for (unsigned int i = 0; i < classCount; i++) {
@@ -700,5 +735,8 @@ static NSArray *dropWebM(NSArray *formats) {
             free(methods);
         }
         free(classes);
-    });
+    };
+
+    sweep(); // synchronous — blocks early iosantiabuse calls at dyld-init time
+    dispatch_async(dispatch_get_main_queue(), sweep); // catches GPB classes registered later
 }
