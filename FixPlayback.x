@@ -510,161 +510,14 @@ static NSArray *dropWebM(NSArray *formats) {
 
 @end
 
-// ---------------------------------------------------------------------------
-// YTClientSpoofProtocol — spoof /youtubei/v1/player to TVHTML5 client
-//
-// Root cause of spc 403s on ALL DASH formats (not just WebM):
-//   GVS enforces PO token validation via the `spc` (Stream Protection Context)
-//   parameter embedded in EVERY DASH segment URL for the IOS client.  The
-//   `spc` is generated server-side at player-request time; without a valid PO
-//   token from AppAttest, GVS returns 403 regardless of format.
-//
-// Fix: intercept /youtubei/v1/player and change clientName from IOS (5) to
-// TVHTML5 (7).  The TV client does NOT require PO token attestation.  Its
-// player response includes hlsManifestUrl in streamingData; the MLAVPlayer we
-// create in makeAVPlayer() loads that HLS manifest via AVFoundation (not
-// Cronet), which fetches HLS segments that carry no spc enforcement.
-//
-// Two intercept layers (belt-and-suspenders):
-//   A) NSURLProtocol subclass — catches NSURLSession-based requests.
-//   B) NSMutableURLRequest.setHTTPBody: hook — catches requests assembled by
-//      any code path (including Cronet bridge) before sending.
-// ---------------------------------------------------------------------------
-
-static NSData *ytuhd_spoofBody(NSData *body) {
-    if (!body.length) return body;
-    NSError *err = nil;
-    id parsed = [NSJSONSerialization JSONObjectWithData:body
-                                               options:NSJSONReadingMutableContainers
-                                                 error:&err];
-    if (err || ![parsed isKindOfClass:[NSMutableDictionary class]]) return body;
-    NSMutableDictionary *root   = (NSMutableDictionary *)parsed;
-    NSMutableDictionary *ctx    = root[@"context"];
-    NSMutableDictionary *client = ctx[@"client"];
-    if (![client isKindOfClass:[NSMutableDictionary class]]) return body;
-    if (![client[@"clientName"] isEqualToString:@"IOS"])     return body;
-    // Switch to TVHTML5 — TV client returns hlsManifestUrl, no PO token needed.
-    client[@"clientName"]    = @"TVHTML5";
-    client[@"clientVersion"] = @"7.20240918.01.00";
-    // Remove IOS-specific device fields that are invalid for TVHTML5.
-    [client removeObjectForKey:@"deviceMake"];
-    [client removeObjectForKey:@"deviceModel"];
-    [client removeObjectForKey:@"osName"];
-    [client removeObjectForKey:@"osVersion"];
-    [client removeObjectForKey:@"deviceExperimentId"];
-    NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:&err];
-    return err ? body : out;
-}
-
-static NSData *ytuhd_readBody(NSURLRequest *req) {
-    if (req.HTTPBody) return req.HTTPBody;
-    NSInputStream *s = req.HTTPBodyStream;
-    if (!s) return nil;
-    [s open];
-    NSMutableData *buf = [NSMutableData dataWithCapacity:8192];
-    uint8_t tmp[4096]; NSInteger n;
-    while ([s hasBytesAvailable] && (n = [s read:tmp maxLength:sizeof(tmp)]) > 0)
-        [buf appendBytes:tmp length:n];
-    [s close];
-    return buf.length ? buf : nil;
-}
-
-static NSString *const kSpoofMarker = @"YTUHDSpoofed";
-
-@interface YTClientSpoofProtocol : NSURLProtocol <NSURLSessionDataDelegate>
-@property (nonatomic, strong) NSURLSession     *fwdSession;
-@property (nonatomic, strong) NSURLSessionDataTask *fwdTask;
-@end
-
-@implementation YTClientSpoofProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)req {
-    if ([NSURLProtocol propertyForKey:kSpoofMarker inRequest:req]) return NO;
-    return [req.URL.path containsString:@"/youtubei/v1/player"];
-}
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)req { return req; }
-+ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
-    return [super requestIsCacheEquivalent:a toRequest:b];
-}
-
-- (void)startLoading {
-    NSMutableURLRequest *mod = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:kSpoofMarker inRequest:mod];
-    [mod setValue:@"7"                forHTTPHeaderField:@"X-Youtube-Client-Name"];
-    [mod setValue:@"7.20240918.01.00" forHTTPHeaderField:@"X-Youtube-Client-Version"];
-    NSData *spoofed = ytuhd_spoofBody(ytuhd_readBody(self.request));
-    if (spoofed) {
-        mod.HTTPBody = spoofed;
-        [mod setValue:[NSString stringWithFormat:@"%lu", (unsigned long)spoofed.length]
-   forHTTPHeaderField:@"Content-Length"];
-    }
-    // Ephemeral session with empty protocolClasses so the forwarded request
-    // bypasses all our protocols (kSpoofMarker tag is the belt-and-suspenders).
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.protocolClasses = @[];
-    self.fwdSession = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
-    self.fwdTask    = [self.fwdSession dataTaskWithRequest:mod];
-    [self.fwdTask resume];
-}
-
-- (void)stopLoading {
-    [self.fwdTask cancel];
-    [self.fwdSession invalidateAndCancel];
-    self.fwdTask = nil; self.fwdSession = nil;
-}
-
-- (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t
-                             didReceiveResponse:(NSURLResponse *)resp
-                             completionHandler:(void (^)(NSURLSessionResponseDisposition))ch {
-    [self.client URLProtocol:self didReceiveResponse:resp
-          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    ch(NSURLSessionResponseAllow);
-}
-- (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t didReceiveData:(NSData *)d {
-    [self.client URLProtocol:self didLoadData:d];
-}
-- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t didCompleteWithError:(NSError *)err {
-    if (err) [self.client URLProtocol:self didFailWithError:err];
-    else     [self.client URLProtocolDidFinishLoading:self];
-}
-- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t
-        willPerformHTTPRedirection:(NSHTTPURLResponse *)resp
-                        newRequest:(NSURLRequest *)req
-                 completionHandler:(void (^)(NSURLRequest *))ch { ch(req); }
-
-@end
-
-// Belt-and-suspenders: hook NSMutableURLRequest.setHTTPBody: to spoof any
-// request built by code paths that don't go through NSURLSession protocol
-// classes (Cronet bridge, CFNetwork direct calls, etc.).
-%hook NSMutableURLRequest
-- (void)setHTTPBody:(NSData *)data {
-    if (data.length > 0 && [self.URL.path containsString:@"/youtubei/v1/player"]) {
-        NSData *spoofed = ytuhd_spoofBody(data);
-        if (spoofed && spoofed != data) {
-            [self setValue:@"7"                forHTTPHeaderField:@"X-Youtube-Client-Name"];
-            [self setValue:@"7.20240918.01.00" forHTTPHeaderField:@"X-Youtube-Client-Version"];
-            %orig(spoofed);
-            return;
-        }
-    }
-    %orig;
-}
-%end
-
-// Inject both protocols into every NSURLSessionConfiguration so they are
+// Inject YTUHDAntiAbuseProtocol into every NSURLSessionConfiguration so it is
 // active for all sessions YouTube creates, including custom/ephemeral ones
 // that ignore +[NSURLProtocol registerClass:].
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
     NSMutableArray *classes = [[NSMutableArray alloc] initWithArray:(%orig ?: @[])];
-    // Insert in reverse priority (index 0 = first checked).
-    // Spoof goes before AntiAbuse so the player request is rewritten
-    // before any other protocol sees it.
     Class antiAbuse = [YTUHDAntiAbuseProtocol class];
-    Class spoof     = [YTClientSpoofProtocol class];
     if (![classes containsObject:antiAbuse]) [classes insertObject:antiAbuse atIndex:0];
-    if (![classes containsObject:spoof])     [classes insertObject:spoof     atIndex:0];
     return classes;
 }
 %end
@@ -803,7 +656,6 @@ static NSString *const kSpoofMarker = @"YTUHDSpoofed";
     %init;
     // Belt-and-suspenders registration for NSURLConnection and any session
     // using the default URL loading system (complements the configuration hook).
-    [NSURLProtocol registerClass:[YTClientSpoofProtocol class]];
     [NSURLProtocol registerClass:[YTUHDAntiAbuseProtocol class]];
 
     // Runtime enumeration: hook hasPoToken and isIosguardAttestationEnabled on
