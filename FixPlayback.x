@@ -262,7 +262,7 @@ static NSArray *dropWebM(NSArray *formats) {
     return [formats filteredArrayUsingPredicate:
         [NSPredicate predicateWithBlock:
             ^BOOL(MLFormat *fmt, NSDictionary *__unused bindings) {
-                if (![fmt isKindOfClass:[MLFormat class]]) return YES;
+                if (![fmt isKindOfClass:%c(MLFormat)]) return YES;
                 NSString *urlStr = [[fmt URL] absoluteString];
                 if (!urlStr) return YES;
                 // MIME type appears in the URL as mime=audio/webm or
